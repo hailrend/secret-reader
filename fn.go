@@ -84,10 +84,21 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 	}
 
 	uid := gjson.Get(string(xr), "metadata.uid").String()
+	mergedData := make(map[string]interface{})
 
-	incomingSecret, err := clientset.CoreV1().Secrets("crossplane-system").Get(context.TODO(), in.SecretName, metav1.GetOptions{})
-	if err != nil {
-		incomingSecret = nil
+	for i, s := range in.SecretNames {
+		i++
+		incomingSecret, err := clientset.CoreV1().Secrets("crossplane-system").Get(context.TODO(), s, metav1.GetOptions{})
+		if err != nil {
+			incomingSecret = nil
+		}
+		if incomingSecret != nil {
+			mergedData = make(map[string]interface{}, len(incomingSecret.StringData))
+
+			for k, v := range incomingSecret.StringData {
+				convertToMap(mergedData, k, v)
+			}
+		}
 	}
 
 	secretExists := true
@@ -95,15 +106,6 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 	if err != nil {
 		secretExists = false
 		secret = nil
-	}
-
-	mergedData := make(map[string]interface{})
-	if incomingSecret != nil {
-		mergedData = make(map[string]interface{}, len(incomingSecret.StringData))
-
-		for k, v := range incomingSecret.StringData {
-			convertToMap(mergedData, k, v)
-		}
 	}
 
 	if secretExists {

@@ -22,5 +22,5 @@ type Input struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	SecretName string `json:"secretName"`
+	SecretNames []string `json:"secretNames"`
 }
