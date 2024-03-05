@@ -8,7 +8,6 @@ import (
 	"github.com/crossplane/function-sdk-go/request"
 	"github.com/crossplane/function-sdk-go/resource"
 	"github.com/crossplane/function-sdk-go/response"
-	"github.com/tidwall/gjson"
 	"google.golang.org/protobuf/types/known/structpb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"log"
 	"reflect"
 	"strings"
 	"xpkg.upbound.io/hailrend/secret-reader/input/v1beta1"
@@ -34,8 +34,6 @@ type Function struct {
 
 // RunFunction runs the Function.
 func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequest) (*fnv1beta1.RunFunctionResponse, error) {
-	f.log.Info("Running function", "tag", req.GetMeta().GetTag())
-
 	rsp := response.To(req, response.DefaultTTL)
 
 	in := &v1beta1.Input{}
@@ -62,29 +60,10 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		f.log.Debug("Loaded Composition environment from Function context", "context-key", FunctionContextKeyEnvironment)
 	}
 
-	c, err := request.GetObservedCompositeResource(req)
-	if err != nil {
-		response.Fatal(rsp, errors.Wrapf(err, err.Error()))
+	mergedData := inputEnv.Object
+	if mergedData == nil {
+		mergedData = make(map[string]interface{})
 	}
-	name := c.Resource.GetClaimReference().Name
-	namespace := c.Resource.GetClaimReference().Namespace
-	apiVersion := c.Resource.GetClaimReference().APIVersion
-	kind := c.Resource.GetClaimReference().Kind
-	claim, err := clientset.RESTClient().Get().AbsPath("/apis/" + apiVersion + "/namespaces/" + namespace + "/" + kind + "s/" + name).DoRaw(context.TODO())
-	if err != nil {
-		response.Fatal(rsp, errors.Wrapf(err, "cannote get composite resource from %T", req))
-	}
-
-	name = gjson.Get(string(claim), "spec.resourceRef.name").String()
-	apiVersion = gjson.Get(string(claim), "spec.resourceRef.apiVersion").String()
-	kind = gjson.Get(string(claim), "spec.resourceRef.kind").String()
-	xr, err := clientset.RESTClient().Get().AbsPath("/apis/" + apiVersion + "/" + kind + "s/" + name).DoRaw(context.TODO())
-	if err != nil {
-		response.Fatal(rsp, errors.Wrapf(err, "cannote get composite resource from %T", req))
-	}
-
-	uid := gjson.Get(string(xr), "metadata.uid").String()
-	mergedData := make(map[string]interface{})
 
 	for i, s := range in.SecretNames {
 		i++
@@ -93,10 +72,45 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 			incomingSecret = nil
 		}
 		if incomingSecret != nil {
-			mergedData = make(map[string]interface{}, len(incomingSecret.StringData))
+			for k, v := range incomingSecret.Data {
+				mergedData = insertInMap(mergedData, k, string(v))
+			}
+		}
+	}
 
-			for k, v := range incomingSecret.StringData {
-				convertToMap(mergedData, k, v)
+	c, err := request.GetObservedCompositeResource(req)
+	if err != nil {
+		response.Fatal(rsp, errors.Wrapf(err, err.Error()))
+	}
+
+	uid := (c.Resource.Unstructured.Object["metadata"].(map[string]interface{}))["uid"].(string)
+	spec := c.Resource.Unstructured.Object["spec"].(map[string]interface{})
+
+	if val, ok := spec["dependencies"]; ok {
+
+		deps := val.(map[string]interface{})
+		if deps != nil {
+			for k, v := range deps {
+				n := (v.(map[string]interface{})["name"]).(string)
+				inputs := (v.(map[string]interface{})["inputs"]).(map[string]interface{})
+				depSecret, err := clientset.CoreV1().Secrets("crossplane-system").Get(context.TODO(), n, metav1.GetOptions{})
+				if err != nil {
+					log.Println("problema " + err.Error())
+					depSecret = nil
+				}
+				if depSecret != nil {
+
+					for k1, v1 := range depSecret.Data {
+						for k2, v2 := range inputs {
+
+							if k1 == v2.(string) {
+								newN := "external." + k + "." + k2
+								mergedData = insertInMap(mergedData, newN, string(v1))
+								break
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -105,17 +119,14 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 	secret, err := clientset.CoreV1().Secrets("crossplane-system").Get(context.TODO(), uid, metav1.GetOptions{})
 	if err != nil {
 		secretExists = false
+		log.Println("non esiste il secret " + err.Error())
 		secret = nil
 	}
 
 	if secretExists {
-		for k, v := range secret.StringData {
-			convertToMap(mergedData, k, v)
+		for k, v := range secret.Data {
+			mergedData = insertInMap(mergedData, k, string(v))
 		}
-	}
-
-	if inputEnv != nil {
-		mergedData = mergeMaps(inputEnv.Object, mergedData)
 	}
 
 	out := &unstructured.Unstructured{Object: mergedData}
@@ -154,15 +165,22 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		}
 	}
 
+	log.Println("Managed pbc " + uid)
 	return rsp, nil
 }
 
-func convertToMap(m map[string]interface{}, key string, value string) map[string]interface{} {
+func insertInMap(m map[string]interface{}, key string, value string) map[string]interface{} {
 	splits := strings.Split(key, ".")
 	if len(splits) == 1 {
 		m[key] = value
 	} else {
-		m[key] = mergeMaps(m, convertToMap(map[string]interface{}{}, strings.Join(splits[1:], "."), value))
+		mapp := make(map[string]interface{})
+		if val, ok := m[splits[0]]; ok {
+			if _, ok := val.(map[string]interface{}); ok {
+				mapp = val.(map[string]interface{})
+			}
+		}
+		m[splits[0]] = insertInMap(mapp, strings.Join(splits[1:], "."), value)
 	}
 	return m
 }
