@@ -65,19 +65,6 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		mergedData = make(map[string]interface{})
 	}
 
-	for i, s := range in.SecretNames {
-		i++
-		incomingSecret, err := clientset.CoreV1().Secrets("crossplane-system").Get(context.TODO(), s, metav1.GetOptions{})
-		if err != nil {
-			incomingSecret = nil
-		}
-		if incomingSecret != nil {
-			for k, v := range incomingSecret.Data {
-				mergedData = insertInMap(mergedData, k, string(v))
-			}
-		}
-	}
-
 	c, err := request.GetObservedCompositeResource(req)
 	if err != nil {
 		response.Fatal(rsp, errors.Wrapf(err, err.Error()))
