@@ -60,18 +60,37 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		f.log.Debug("Loaded Composition environment from Function context", "context-key", FunctionContextKeyEnvironment)
 	}
 
+	// Init data map with existing context data
 	mergedData := inputEnv.Object
 	if mergedData == nil {
 		mergedData = make(map[string]interface{})
 	}
 
-	c, err := request.GetObservedCompositeResource(req)
+	resources, err := request.GetObservedComposedResources(req)
 	if err != nil {
 		response.Fatal(rsp, errors.Wrapf(err, err.Error()))
 	}
 
-	uid := (c.Resource.Unstructured.Object["metadata"].(map[string]interface{}))["uid"].(string)
-	spec := c.Resource.Unstructured.Object["spec"].(map[string]interface{})
+	xr, err := request.GetObservedCompositeResource(req)
+	if err != nil {
+		response.Fatal(rsp, errors.Wrapf(err, err.Error()))
+	}
+
+	m := make(map[string]interface{})
+	// put resources statuses to xr status
+	for k, v := range resources {
+		interf := v.Resource.Unstructured.Object["status"]
+		if interf != nil {
+			m[string(k)] = interf.(map[string]interface{})["atProvider"]
+			xr.Resource.SetValue("status.atProvider."+string(k), m[string(k)])
+		}
+	}
+	// put resources statuses
+	mergedData = mergeMaps(mergedData, m)
+
+	// put dependency data
+	uid := (xr.Resource.Unstructured.Object["metadata"].(map[string]interface{}))["uid"].(string)
+	spec := xr.Resource.Unstructured.Object["spec"].(map[string]interface{})
 
 	if val, ok := spec["dependencies"]; ok {
 
@@ -102,6 +121,7 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		}
 	}
 
+	// put secret data
 	secretExists := true
 	secret, err := clientset.CoreV1().Secrets("crossplane-system").Get(context.TODO(), uid, metav1.GetOptions{})
 	if err != nil {
@@ -116,6 +136,7 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		}
 	}
 
+	// write data to environment config
 	out := &unstructured.Unstructured{Object: mergedData}
 	if out.GroupVersionKind().Empty() {
 		out.SetGroupVersionKind(schema.GroupVersionKind{Group: "internal.crossplane.io", Kind: "Environment", Version: "v1alpha1"})
@@ -126,6 +147,10 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 	convertToSecret(&secretData, mergedData, "")
 
 	response.SetContextKey(rsp, FunctionContextKeyEnvironment, structpb.NewStructValue(v))
+
+	log.Println(mergedData)
+
+	// write data to secret
 	if !secretExists {
 		secret, err = clientset.CoreV1().Secrets("crossplane-system").Create(context.TODO(), &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
@@ -173,30 +198,34 @@ func insertInMap(m map[string]interface{}, key string, value string) map[string]
 }
 
 func convertToSecret(list *map[string][]byte, m map[string]interface{}, name string) {
-	for k, v := range m {
-		if reflect.TypeOf(v).Kind() == reflect.Map {
-			convertToSecret(list, m[k].(map[string]interface{}), name+k+".")
-		} else if reflect.TypeOf(v).Kind() == reflect.String {
-			(*list)[name+k] = []byte(v.(string))
+	if len(m) != 0 {
+		for k, v := range m {
+			if reflect.TypeOf(v).Kind() == reflect.Map {
+				convertToSecret(list, m[k].(map[string]interface{}), name+k+".")
+			} else if reflect.TypeOf(v).Kind() == reflect.String {
+				(*list)[name+k] = []byte(v.(string))
+			}
 		}
 	}
 }
 
 func mergeMaps(a, b map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{}, len(a))
-	for k, v := range a {
-		out[k] = v
-	}
-	for k, v := range b {
-		if v, ok := v.(map[string]interface{}); ok {
-			if bv, ok := out[k]; ok {
-				if bv, ok := bv.(map[string]interface{}); ok {
-					out[k] = mergeMaps(bv, v)
-					continue
+	if len(b) != 0 {
+		for k, v := range a {
+			out[k] = v
+		}
+		for k, v := range b {
+			if v, ok := v.(map[string]interface{}); ok {
+				if bv, ok := out[k]; ok {
+					if bv, ok := bv.(map[string]interface{}); ok {
+						out[k] = mergeMaps(bv, v)
+						continue
+					}
 				}
 			}
+			out[k] = v
 		}
-		out[k] = v
 	}
 	return out
 }
