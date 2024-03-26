@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/crossplane/crossplane-runtime/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	fnv1beta1 "github.com/crossplane/function-sdk-go/proto/v1beta1"
@@ -17,6 +18,8 @@ import (
 	"k8s.io/client-go/rest"
 	"log"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"xpkg.upbound.io/hailrend/secret-reader/input/v1beta1"
 )
@@ -78,11 +81,34 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 
 	m := make(map[string]interface{})
 	// put resources statuses to xr status
+	r, _ := regexp.Compile("[a-zA-Z0-9]*-\\d")
 	for k, v := range resources {
 		interf := v.Resource.Unstructured.Object["status"]
 		if interf != nil {
-			m[string(k)] = interf.(map[string]interface{})["atProvider"]
-			xr.Resource.SetValue("status.atProvider."+string(k), m[string(k)])
+			key := string(k)
+			// if is array
+			if r.MatchString(key) {
+				i, err := strconv.Atoi(key[strings.LastIndex(key, "-")+1 : len(key)])
+				if err != nil {
+					response.Fatal(rsp, errors.Wrapf(err, err.Error()))
+				}
+				rest := key[0:strings.LastIndex(key, "-")]
+				_, ok := m[rest]
+
+				if !ok {
+					m[rest] = make([]map[string]interface{}, 0)
+				}
+				p := len(m[rest].([]map[string]interface{}))
+				if p <= i {
+					for d := p; d <= i; d++ {
+						m[rest] = append(m[rest].([]map[string]interface{}), make(map[string]interface{}))
+					}
+				}
+				(m[rest].([]map[string]interface{}))[i] = (interf.(map[string]interface{})["atProvider"]).(map[string]interface{})
+			} else {
+				m[key] = interf.(map[string]interface{})["atProvider"].(map[string]interface{})
+			}
+			xr.Resource.SetValue("status.atProvider."+key, m[key])
 		}
 	}
 	// put resources statuses
@@ -136,6 +162,11 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 		}
 	}
 
+	b, err := json.MarshalIndent(mergedData, "", "  ")
+	if err != nil {
+		log.Println("error:", err)
+	}
+	log.Println(string(b))
 	// write data to environment config
 	out := &unstructured.Unstructured{Object: mergedData}
 	if out.GroupVersionKind().Empty() {
@@ -147,8 +178,6 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1beta1.RunFunctionRequ
 	convertToSecret(&secretData, mergedData, "")
 
 	response.SetContextKey(rsp, FunctionContextKeyEnvironment, structpb.NewStructValue(v))
-
-	log.Println(mergedData)
 
 	// write data to secret
 	if !secretExists {
@@ -201,7 +230,15 @@ func convertToSecret(list *map[string][]byte, m map[string]interface{}, name str
 	if len(m) != 0 {
 		for k, v := range m {
 			if reflect.TypeOf(v).Kind() == reflect.Map {
-				convertToSecret(list, m[k].(map[string]interface{}), name+k+".")
+				convertToSecret(list, v.(map[string]interface{}), name+k+".")
+			} else if reflect.TypeOf(v).Kind() == reflect.Array {
+				for i, p := range v.([]interface{}) {
+					if reflect.TypeOf(p).Kind() == reflect.String {
+						(*list)[name+k+"-"+string(i)] = []byte(p.(string))
+					} else {
+						convertToSecret(list, p.(map[string]interface{}), name+k+"-"+string(i)+".")
+					}
+				}
 			} else if reflect.TypeOf(v).Kind() == reflect.String {
 				(*list)[name+k] = []byte(v.(string))
 			}
