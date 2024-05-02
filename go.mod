@@ -1,4 +1,4 @@
-module xpkg.upbound.io/hailrend/secret-reader
+module xpkg.upbound.io/hailrend/go-cleaner
 
 go 1.21
 
